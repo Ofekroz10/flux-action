@@ -182,7 +182,8 @@ def default_dtype(dtype: torch.dtype):
 def load_action_checkpoint(
     model: JointSingleSeq, ckpt_path: str, modality: str, *, strict_heads: bool = False, head_seed: int = 0
 ) -> None:
-    """Load a trunk / finetuned ``.safetensors`` into an action DiT built with :func:`action_dit_params`.
+    """Load a trunk / finetuned ``.safetensors`` into an action DiT built with :func:`action_dit_params`. A policy export
+    (every key under ``dit.``, e.g. the released DROID policy's ``model.safetensors``) loads with ``strict_heads``.
 
     ``strict_heads=True`` demands that the checkpoint already contains the embodiment heads (a finetuned
     checkpoint); ``False`` accepts an action-pretrained trunk and gives the missing heads the reference
@@ -198,6 +199,11 @@ def load_action_checkpoint(
         sd = {
             key: checkpoint.get_tensor(key) for key in checkpoint.keys() if stream_of_key(key) not in unused
         }
+    if sd and all(key.startswith("dit.") for key in sd):
+        # a policy export (``model.safetensors`` of a released policy): the DiT under ``dit.``, heads included. A
+        # finetune from it must keep its trained heads, never draw fresh ones.
+        sd = {key.removeprefix("dit."): value for key, value in sd.items()}
+        strict_heads = True
     sd = remap_shared_action_keys(sd, modality)
     fresh_prefixes = tuple(n + "." for n in fresh_module_names(modality))
     if strict_heads:

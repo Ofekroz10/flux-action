@@ -185,6 +185,9 @@ class PreparedWindows:
     actions: Tensor  # (n, chunk, D), gripper-flipped targets (absolute or deltas), normalized
     action_mask: Tensor | None = None  # (n, D) 1/0 per action dim; None = all dims trained (see flow_loss)
     action_prefix_lengths: Tensor | None = None  # (n,) clean RTC prefix per window; None = no RTC
+    # DSF (``flux_action.dsf``): per window the predicted video tokens (t h w order) and action tokens at t_high
+    dsf_video_high: Tensor | None = None  # (n, latent frames x h x w) bool
+    dsf_action_high: Tensor | None = None  # (n, chunk) bool
     event: Any = None
 
     def tensors(self):
@@ -196,6 +199,9 @@ class PreparedWindows:
             yield self.action_mask
         if self.action_prefix_lengths is not None:
             yield self.action_prefix_lengths
+        if self.dsf_video_high is not None:
+            yield self.dsf_video_high
+            yield self.dsf_action_high
 
 
 class FluxActionPolicy(nn.Module):
@@ -669,7 +675,13 @@ class FluxActionPolicy(nn.Module):
                 fixed_length=cfg.text_fixed_length if cfg.inference_profile == "history" else None,
             )
         ]
-        latents = self._encode_windows(cams, idx_keep, device, generators, dropped)  # (n, 96, frames, h, w)
+        augment = self.training and cfg.augment
+        augmentations = [
+            packing.sample_augmentation(generators[i], camera_hw=tuple(cams.shape[-2:])) if augment else None
+            for i in idx_keep
+        ]  # drawn in window order, as _encode_windows always did
+        latents = self._encode_windows(cams, idx_keep, device, augmentations, dropped)  # (n, 96, frames, h, w)
+        dsf_video, dsf_action = self._dsf_masks(batch, idx_keep, augmentations, latents.shape, device)
         # Optional per-window action mask (B, D): a dataset that pools embodiments of different action widths
         # into one head pads the narrow ones and masks the padding out of the loss.
         mask = batch.get("action_mask")
@@ -686,7 +698,55 @@ class FluxActionPolicy(nn.Module):
             actions[idx_keep],
             mask,
             action_prefix_lengths=prefixes,
+            dsf_video_high=dsf_video,
+            dsf_action_high=dsf_action,
         )
+
+    def _dsf_masks(
+        self,
+        batch: dict[str, Any],
+        idx: list[int],
+        augmentations: list[dict | None],
+        latent_shape: torch.Size,
+        device: torch.device,
+    ) -> tuple[Tensor | None, Tensor | None]:
+        """DSF windows (``dsf_union`` in the batch): the hidden-camera pixel masks -> per-window token masks
+        ``(n, frames x h x w)`` and ``(n, chunk)``, after each window's own crop augmentation. ``(None, None)`` otherwise."""
+        if "dsf_union" not in batch:
+            return None, None
+        from .dsf import masks as dsf_masks
+
+        cfg = self.config
+        frames, h, w = latent_shape[2] - 1, latent_shape[3], latent_shape[4]
+        if (
+            cfg.camera_layout != "droid"
+            or (frames, h, w) != (dsf_masks.PREDICTED_BLOCKS, *dsf_masks.LATENT_HW)
+            or cfg.chunk_size != dsf_masks.CHUNK
+        ):
+            raise ValueError(
+                f"DSF masks are for the droid canvas: {dsf_masks.PREDICTED_BLOCKS} latent frames of "
+                f"{dsf_masks.LATENT_HW} tokens and {dsf_masks.CHUNK} actions, got {(frames, h, w)} and {cfg.chunk_size}"
+            )
+        union = torch.as_tensor(batch["dsf_union"]).numpy()
+        block_high = torch.as_tensor(batch["dsf_block_high"]).numpy()
+        hidden = torch.as_tensor(batch["dsf_hidden"]).tolist()
+        ring = torch.as_tensor(batch["dsf_random_ring"]).tolist()
+        episodes = torch.as_tensor(batch["dsf_episode_index"]).tolist()
+        starts = torch.as_tensor(batch["dsf_start"]).tolist()
+        video, action = [], []
+        for i, augmentation in zip(idx, augmentations, strict=True):
+            v, a = dsf_masks.window_token_masks(
+                union[i],
+                block_high[i],
+                dsf_masks.HIDDEN_CAMERAS[hidden[i]],
+                augmentation=augmentation,
+                random_ring=bool(ring[i]),
+                episode_index=episodes[i],
+                start=starts[i],
+            )
+            video.append(torch.from_numpy(v.reshape(-1)))
+            action.append(torch.from_numpy(a))
+        return torch.stack(video).to(device, non_blocking=True), torch.stack(action).to(device, non_blocking=True)
 
     def _rtc_prefix_lengths(self, batch: dict[str, Any], batch_size: int) -> Tensor | None:
         """Per-window RTC prefix lengths ``(B,)``: ``rtc_prefix_lengths`` from the batch when given, else drawn
@@ -726,10 +786,15 @@ class FluxActionPolicy(nn.Module):
         )
 
     def forward(
-        self, batch: dict[str, Any], prepared: PreparedWindows | None = None
+        self,
+        batch: dict[str, Any],
+        prepared: PreparedWindows | None = None,
+        *,
+        fixed_timestep: float | None = None,
     ) -> tuple[Tensor, dict[str, Any]]:
         """Training loss of a micro-batch; ``prepared`` is the output of :meth:`prepare` for this batch
-        (computed here when not given)."""
+        (computed here when not given). DSF windows get two noise levels (``flux_action.dsf.noise``);
+        ``fixed_timestep`` instead noises every predicted token of every window at that one level (validation)."""
         cfg = self.config
         if prepared is None:
             prepared = self.prepare(batch)
@@ -756,10 +821,28 @@ class FluxActionPolicy(nn.Module):
                 self.modality,
                 scale=cfg.action_scale,
             )
-        timesteps = packing.sample_timesteps(n, None, cfg.train_timestep_width, cfg.train_timestep_shift)
-        action_timesteps = timesteps
-        if cfg.separate_timesteps:
-            timesteps = torch.sigmoid(torch.randn(n) * cfg.video_logit_std + cfg.video_logit_mean)
+        dsf = prepared.dsf_video_high is not None
+        dsf_info: dict[str, Any] = {}
+        if fixed_timestep is not None:
+            timesteps = torch.full((n,), float(fixed_timestep))
+            action_timesteps = timesteps
+        elif dsf:
+            if cfg.separate_timesteps:
+                raise ValueError("DSF windows draw their own two levels; separate_timesteps must be off")
+            from .dsf import noise as dsf_noise
+
+            low, high = dsf_noise.draw_levels(
+                n, cfg.dsf_low_timesteps, width=cfg.train_timestep_width, shift=cfg.train_timestep_shift
+            )
+            timesteps, action_timesteps = dsf_noise.token_timesteps(
+                low, high, prepared.dsf_video_high, prepared.dsf_action_high
+            )
+            dsf_info = {"dsf_t_low": low.mean(), "dsf_t_high": high.mean()}
+        else:
+            timesteps = packing.sample_timesteps(n, None, cfg.train_timestep_width, cfg.train_timestep_shift)
+            action_timesteps = timesteps
+            if cfg.separate_timesteps:
+                timesteps = torch.sigmoid(torch.randn(n) * cfg.video_logit_std + cfg.video_logit_mean)
         kwargs, targets, _ = packing.build_forward_kwargs(
             video,
             action,
@@ -792,13 +875,33 @@ class FluxActionPolicy(nn.Module):
                 >= prepared.action_prefix_lengths[:, None]
             ),
         )
+        if dsf:
+            dsf_info.update(self._dsf_hidden_losses(pred, packing.flatten_windows(targets), prepared))
         # the MSEs stay on the device (detached): a float() here would wait for the forward and delay
         # the launch of the next micro-batch's encoders
         return losses["loss"], {
             "video_mse": losses["video_mse"],
             "action_mse": losses["action_mse"],
             "n_valid_windows": n,
+            **dsf_info,
         }
+
+    def _dsf_hidden_losses(
+        self, pred: dict[str, Tensor], targets: dict[str, Tensor], prepared: PreparedWindows
+    ) -> dict[str, Tensor]:
+        """For logging: the MSE of the hidden (t_high) video tokens and action tokens alone, and their shares."""
+        ak = f"x_{self.modality}"
+        out = {}
+        for name, key, mask in (
+            ("video", "x_video", prepared.dsf_video_high),
+            ("action", ak, prepared.dsf_action_high),
+        ):
+            flat = mask.reshape(-1).to(pred[key].device)
+            mse = ((pred[key].float() - targets[key].float()) ** 2).mean(-1).reshape(-1)
+            count = flat.sum()
+            out[f"dsf_{name}_hidden_mse"] = ((mse * flat).sum() / count.clamp_min(1)).detach()
+            out[f"dsf_{name}_hidden_share"] = (count.float() / flat.numel()).detach()
+        return out
 
     @staticmethod
     def _drop_cameras(cams: Tensor, dropped: list[int]) -> Tensor:
@@ -814,18 +917,17 @@ class FluxActionPolicy(nn.Module):
         cams: Tensor,
         idx: list[int],
         device: torch.device,
-        generators: list[torch.Generator | None],
+        augmentations: list[dict | None],
         dropped: list[list[int]] | None = None,
     ) -> Tensor:
         """Augment, compose and VAE-encode the windows ``idx`` of ``cams``: ``(len(idx), 96, frames, h, w)``.
 
-        The augmentation of window ``i`` is drawn from ``generators[i]`` (the global RNG when ``None``), in
-        window order; ``dropped[i]`` lists the cameras of window ``i`` that become gray tiles;
-        ``vae_batch_windows`` windows share one VAE call.
+        ``augmentations[k]`` is the augmentation of window ``idx[k]`` (None = none; :meth:`prepare` draws them, so
+        the DSF masks can follow the same crop); ``dropped[i]`` lists the cameras of window ``i`` that become gray
+        tiles; ``vae_batch_windows`` windows share one VAE call.
         """
         cfg = self.config
-        augment = self.training and cfg.augment
-        camera_hw = tuple(cams.shape[-2:])
+        augmentation_of = dict(zip(idx, augmentations, strict=True))
         latents = []
         for start in range(0, len(idx), cfg.vae_batch_windows):
             videos = torch.stack(
@@ -837,7 +939,7 @@ class FluxActionPolicy(nn.Module):
                             else cams[i],
                             dropped[i] if dropped else [],
                         ),
-                        packing.sample_augmentation(generators[i], camera_hw=camera_hw) if augment else None,
+                        augmentation_of[i],
                         device,
                         layout=cfg.camera_layout,
                         canvas_hw=cfg.canvas_hw,
