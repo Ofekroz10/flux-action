@@ -411,7 +411,8 @@ def sample_timesteps(
 
 
 def add_noise(x0: Tensor, t: Tensor, generator: torch.Generator | None = None) -> tuple[Tensor, Tensor]:
-    """``x_t = t * eps + (1 - t) * x0``; velocity target ``eps - x0``. ``t`` is ``(B,)``.
+    """``x_t = t * eps + (1 - t) * x0``; velocity target ``eps - x0``. ``t`` is ``(B,)``, or ``(B, N)`` for one level per
+    token (DSF: two noise levels in one window).
 
     Everything is computed in ``x0.dtype`` after rounding ``t`` and ``eps`` to it: the reference packs
     latents, noise and timesteps in bfloat16 and noises in that dtype, so a bf16 window sees ``t`` on
@@ -420,9 +421,19 @@ def add_noise(x0: Tensor, t: Tensor, generator: torch.Generator | None = None) -
     eps_ = torch.randn(x0.shape, generator=generator, dtype=torch.float32).to(
         device=x0.device, dtype=x0.dtype
     )
-    tt = t.to(device=x0.device, dtype=x0.dtype).view(-1, *([1] * (x0.ndim - 1)))
+    tt = t.to(device=x0.device, dtype=x0.dtype)
+    tt = tt.view(*tt.shape, *([1] * (x0.ndim - tt.ndim)))
     x_t = tt * eps_ + (1 - tt) * x0
     return x_t, eps_ - x0
+
+
+def _per_token(t: Tensor, shape: torch.Size) -> Tensor:
+    """``(B,)`` or ``(B, N)`` timesteps -> ``(B, N)`` per token."""
+    if t.ndim == 2:
+        if tuple(t.shape) != tuple(shape):
+            raise ValueError(f"per-token timesteps {tuple(t.shape)} do not match the stream {tuple(shape)}")
+        return t.clone()
+    return t[:, None] * torch.ones(shape, device=t.device)
 
 
 def build_forward_kwargs(
@@ -440,7 +451,8 @@ def build_forward_kwargs(
     """Assemble one training call: ``(forward_kwargs, flow_targets, clean_latents)``.
 
     Conditioning streams (``x_video_cond``, ``x_<modality>_cond``) stay clean at timestep 0. Predicted
-    streams use ``t`` and optionally separate ``action_timesteps``, rounded to their latent dtype.
+    streams use ``t`` and optionally separate ``action_timesteps``, rounded to their latent dtype: ``(B,)`` (one level per window) or
+    ``(B, Nv)`` / ``(B, Na)`` (one per token, DSF).
     Optional conditioning noise applies only to visual snapshots; state/command history stays clean.
     The timesteps handed to the model are fp32 tensors holding the rounded values. ``action_prefix_lengths``
     ``(B,)`` (RTC) keeps the first ``P`` action tokens of each window clean at timestep 0.
@@ -455,10 +467,10 @@ def build_forward_kwargs(
     kw = {
         "x_video": xv,
         "x_video_ids": video["x_video_ids"].to(dev),
-        "x_video_timesteps": tt[:, None] * torch.ones(xv.shape[:2], device=dev),
+        "x_video_timesteps": _per_token(tt, xv.shape[:2]),
         ak: xa,
         f"{ak}_ids": action[f"{ak}_ids"].to(dev),
-        f"{ak}_timesteps": tt_action[:, None] * torch.ones(xa.shape[:2], device=dev),
+        f"{ak}_timesteps": _per_token(tt_action, xa.shape[:2]),
         "x_video_cond": video["x_video_cond"],
         "x_video_cond_ids": video["x_video_cond_ids"].to(dev),
         "x_video_cond_timesteps": torch.zeros(video["x_video_cond"].shape[:2], device=dev),
@@ -468,7 +480,7 @@ def build_forward_kwargs(
         **text,
     }
     if conditioning_noise_max:
-        cond_t = torch.rand(t.shape, generator=generator) * conditioning_noise_max
+        cond_t = torch.rand(t.shape[:1], generator=generator) * conditioning_noise_max  # one level per window
         kw["x_video_cond"], _ = add_noise(video["x_video_cond"], cond_t, generator)
         cond_tt = cond_t.to(device=dev, dtype=kw["x_video_cond"].dtype).float()
         kw["x_video_cond_timesteps"] = cond_tt[:, None].expand(video["x_video_cond"].shape[:2])

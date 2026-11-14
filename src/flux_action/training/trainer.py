@@ -153,11 +153,26 @@ class TrainConfig:
     # A resumed run must carry the checkpoint's run seed unless explicitly allowed (branching a new run).
     allow_seed_change: bool = False
     max_epochs: int | None = None
+    # DSF (``flux_action.dsf``): {"masks_root": dsf_flux run folder, "run": "k0_ringrandom", "split": split.json},
+    # read by the DSF dataset plugs. Their windows train with two noise levels (PolicyConfig.dsf_low_timesteps).
+    dsf: dict[str, Any] | None = None
+    # Held-out validation: a dataset plug like ``dataset`` ("pkg.module:callable", e.g.
+    # "flux_action.dsf.dataset:build_validation"), run every ``validation_every`` updates on ``validation_batches``
+    # batches per rank with seeded noise (comparable across validations; the training RNG is untouched). It logs the
+    # loss, the DSF hidden-token losses and the regular single-level loss at each of ``validation_timesteps``.
+    validation_dataset: str | None = None
+    validation_every: int | None = None
+    validation_batches: int = 16
+    validation_timesteps: tuple[float, ...] = (0.1, 0.3, 0.5, 0.7, 0.9)
+    validate_at_start: bool = True
 
     def __post_init__(self):
         self.frame_hw = tuple(self.frame_hw)
         self.betas = tuple(self.betas)
         self.ema_sigma_rels = tuple(self.ema_sigma_rels)
+        self.validation_timesteps = tuple(float(t) for t in self.validation_timesteps)
+        if self.validation_every is not None and (self.validation_every < 1 or not self.validation_dataset):
+            raise ValueError("validation_every needs a positive value and a validation_dataset")
         self.frozen_streams = tuple(self.frozen_streams)
         if self.steps < 1 or self.windows_per_rank < 1 or self.grad_accumulation < 1 or self.num_workers < 1:
             raise ValueError("steps, windows_per_rank, grad_accumulation and num_workers must be positive")
@@ -216,6 +231,9 @@ class Trainer:
         self.output_dir = Path(config.output_dir)
         self.step = 0
         self.epoch_losses: list[float] = []
+        self._epoch_batches = 0
+        self._dataset_size: dict[str, int] = {}
+        self._run_started, self._steps_at_start = time.perf_counter(), 0
         self.encode_stream = torch.cuda.Stream(self.device) if self.device.type == "cuda" else None
         self._prepared: Any = None  # PreparedWindows of the next micro-batch, encoded ahead of its update
 
@@ -550,6 +568,9 @@ class Trainer:
     def train(self) -> dict[str, Any]:
         cfg = self.config
         self._written = self.step if latest_checkpoint(self.output_dir) is not None and self.step > 0 else -1
+        self._run_started, self._steps_at_start = time.perf_counter(), self.step
+        if cfg.validation_every and cfg.validate_at_start and self.step == 0:
+            self._validate()  # the starting checkpoint's baseline
         while self.step < cfg.steps and (cfg.max_epochs is None or self.position.epoch < cfg.max_epochs):
             loader_kwargs = dict(
                 seed=self.state.seed,
@@ -562,12 +583,23 @@ class Trainer:
                 grad_accumulation=cfg.grad_accumulation,
             )
             dataset = self._make_dataset(loader_kwargs)
+            self._epoch_batches = dataset.batches_per_rank
+            self._dataset_size = {
+                key: int(value)
+                for key, value in (
+                    ("dataset_positions", getattr(dataset, "n_positions", 0)),
+                    ("dataset_episodes", len(getattr(dataset, "episodes", []))),
+                    ("dataset_windows", getattr(dataset, "n_windows", 0)),
+                )
+                if value
+            }
             if self.rank == 0 and self.position.batches_consumed == 0:
                 self._log_line(
                     {
                         "event": "epoch",
                         "epoch": self.position.epoch,
                         "batches_per_rank": dataset.batches_per_rank,
+                        **self._dataset_size,
                     }
                 )
             loader = build_dataloader(
@@ -620,14 +652,32 @@ class Trainer:
         metrics["data_wait"] = data_wait
         self.position.batches_consumed += cfg.grad_accumulation
         self.step += 1
-        metrics.update(step=self.step, epoch=self.position.epoch)
+        metrics.update(step=self.step, epoch=self.position.epoch, **self._progress())
         self.epoch_losses.append(metrics["loss"])
         if self.rank == 0 and (self.step % cfg.log_every == 0 or self.step == cfg.steps):
             self._log_line(metrics)
         if self.step % cfg.checkpoint_every == 0 or self.step == cfg.steps:
             self._checkpoint()
             self._written = self.step
+        if cfg.validation_every and (self.step % cfg.validation_every == 0 or self.step == cfg.steps):
+            self._validate()
         return self.step >= cfg.steps
+
+    def _progress(self) -> dict[str, Any]:
+        """Where the run is: overall and epoch fractions, windows trained on, time left at the current pace."""
+        cfg = self.config
+        done = self.step - self._steps_at_start
+        elapsed = time.perf_counter() - self._run_started
+        out = {
+            "progress": round(self.step / cfg.steps, 4),
+            "epoch_progress": round(self.position.batches_consumed / self._epoch_batches, 4)
+            if self._epoch_batches
+            else None,
+            "windows_seen": self.step * cfg.global_batch(self.world_size),
+            "elapsed_h": round(elapsed / 3600, 3),
+            "eta_h": round(elapsed / done * (cfg.steps - self.step) / 3600, 2) if done else None,
+        }
+        return {**out, **self._dataset_size}
 
     def _prepare(self, batch: dict[str, Any]) -> Any:
         """``policy.prepare`` on the side stream, with an event the consumer waits for."""
@@ -647,7 +697,8 @@ class Trainer:
             torch.cuda.reset_peak_memory_stats(self.device)
         accum = len(micro)
         # FP64 matches the previous Python-float accumulation without per-microbatch host waits.
-        metrics = torch.zeros(3, device=self.device, dtype=torch.float64)
+        dsf_keys = DSF_METRICS if self.config.dsf else ()
+        metrics = torch.zeros(3 + len(dsf_keys), device=self.device, dtype=torch.float64)
         windows = 0
         autocast = torch.autocast(
             self.device.type,
@@ -673,6 +724,10 @@ class Trainer:
                         loss.detach().double(),
                         torch.as_tensor(info["video_mse"], device=self.device, dtype=torch.float64),
                         torch.as_tensor(info["action_mse"], device=self.device, dtype=torch.float64),
+                        *(
+                            torch.as_tensor(info.get(key, 0.0), device=self.device, dtype=torch.float64)
+                            for key in dsf_keys
+                        ),
                     ]
                 )
                 / accum
@@ -684,7 +739,7 @@ class Trainer:
             self._check_gradients()
         # Abort on all ranks before anything is mutated: a non-finite update would poison the parameters,
         # the optimizer moments and both EMAs, then be written as a complete checkpoint.
-        loss_mean, video, action = all_reduce_means(metrics)
+        loss_mean, video, action, *dsf_values = all_reduce_means(metrics)
         replicas = self.world_size // (self.config.shard_size or self.world_size) if self.sharded else 1
         grad_norm = global_grad_norm(self.policy, self.device, replicas)
         if not (math.isfinite(loss_mean) and math.isfinite(grad_norm)):
@@ -714,6 +769,7 @@ class Trainer:
             "loss": loss_mean,
             "video_mse": video,
             "action_mse": action,
+            **{key: value for key, value in zip(dsf_keys, dsf_values, strict=True)},
             "grad_norm": grad_norm,
             **clipped,
             "windows": windows * self.world_size,
@@ -737,6 +793,70 @@ class Trainer:
                 f"{len(missing)} trainable parameters received no gradient, e.g. {missing[:4]}; "
                 "add their streams to frozen_streams"
             )
+
+    @torch.no_grad()
+    def _validate(self) -> None:
+        """Held-out losses on ``validation_batches`` batches per rank (the same on every rank, so sharded forwards stay
+        in step). Each batch is noised from its own seed inside ``fork_rng``: every validation sees the same noise
+        and the training RNG continues untouched. Eval mode: no augmentation, no caption dropout."""
+        cfg = self.config
+        started = time.perf_counter()
+        builder = _import_dataset_builder(cfg.validation_dataset)
+        dataset = builder(
+            cfg,
+            seed=cfg.seed,
+            epoch=0,
+            rank=self.rank,
+            world_size=self.world_size,
+            num_workers=cfg.num_workers,
+            windows_per_rank=cfg.windows_per_rank,
+            skip_batches=0,
+            grad_accumulation=1,
+        )
+        batches = min(cfg.validation_batches, dataset.batches_per_rank)
+        loader = build_dataloader(
+            dataset,
+            prefetch_factor=cfg.prefetch_factor,
+            pin_memory=self.device.type == "cuda",
+            in_process=cfg.in_process_loader,
+        )
+        dsf_keys = DSF_METRICS if cfg.dsf else ()
+        names = ["loss", "video_mse", "action_mse", *dsf_keys, *(f"loss_t{t:g}" for t in cfg.validation_timesteps)]
+        sums = torch.zeros(len(names), device=self.device, dtype=torch.float64)
+        autocast = torch.autocast(
+            self.device.type,
+            dtype=self.compute_dtype,
+            enabled=not self.sharded
+            and self.compute_dtype != self.param_dtype
+            and self.device.type == "cuda",
+        )
+        devices = [self.device.index or 0] if self.device.type == "cuda" else []
+        self.policy.eval()
+        try:
+            for b, batch in zip(range(batches), loader, strict=False):
+                with torch.random.fork_rng(devices=devices):
+                    torch.manual_seed(cfg.seed * 1_000_003 + b)
+                    prepared = self.policy.prepare(batch)
+                    with autocast:
+                        loss, info = self.policy(batch, prepared=prepared)
+                        fixed = [
+                            self.policy(batch, prepared=prepared, fixed_timestep=t)[0]
+                            for t in cfg.validation_timesteps
+                        ]
+                row = [loss, info["video_mse"], info["action_mse"], *(info.get(k, 0.0) for k in dsf_keys), *fixed]
+                sums += torch.stack([torch.as_tensor(v, device=self.device, dtype=torch.float64) for v in row])
+        finally:
+            self.policy.train()
+        values = all_reduce_means(sums / max(batches, 1))
+        self._log_line(
+            {
+                "event": "validation",
+                "step": self.step,
+                **{f"val_{name}": value for name, value in zip(names, values, strict=True)},
+                "val_windows": batches * cfg.windows_per_rank * self.world_size,
+                "seconds": round(time.perf_counter() - started, 1),
+            }
+        )
 
     # ------------------------------------------------------------------ side effects
     def _checkpoint(self) -> None:
@@ -784,6 +904,17 @@ class Trainer:
         with (self.output_dir / "metrics.jsonl").open("a") as stream:
             stream.write(line + "\n")
         print(line, flush=True)
+
+
+# DSF metrics averaged per update and validation (``FluxActionPolicy.forward`` info of DSF windows).
+DSF_METRICS = (
+    "dsf_t_low",
+    "dsf_t_high",
+    "dsf_video_hidden_mse",
+    "dsf_action_hidden_mse",
+    "dsf_video_hidden_share",
+    "dsf_action_hidden_share",
+)
 
 
 def _default_policy(config: PolicyConfig) -> nn.Module:

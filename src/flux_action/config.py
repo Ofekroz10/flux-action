@@ -133,6 +133,10 @@ class PolicyConfig:
     video_logit_mean: float = 1.08
     video_logit_std: float = 1.0
     conditioning_noise_max: float = 0.0
+    # DSF windows (a batch carrying ``dsf_union``, see ``flux_action.dsf``): two noise levels per window, t_low for
+    # every predicted token and t_high ~ U[t_low, 1] for the hidden ones. ``uniform``: t_low ~ U[0, 1]; ``recipe``:
+    # t_low from train_timestep_width / train_timestep_shift. Windows without DSF masks are unaffected.
+    dsf_low_timesteps: str = "uniform"
     loss_reduction: str = "joint_tokens"
     action_channel_weights: list[float] | None = None
     action_loss_weight: float = 50.0
@@ -164,6 +168,8 @@ class PolicyConfig:
             raise ValueError("history profiles require checkpoint-native channels without gripper flips")
         if self.loss_reduction not in ("joint_tokens", "modalities"):
             raise ValueError("loss_reduction must be joint_tokens or modalities")
+        if self.dsf_low_timesteps not in ("uniform", "recipe"):
+            raise ValueError("dsf_low_timesteps must be uniform or recipe")
         if not 0 <= self.conditioning_noise_max <= 1:
             raise ValueError("conditioning_noise_max must be between zero and one")
         if (
