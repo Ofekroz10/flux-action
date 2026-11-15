@@ -46,6 +46,7 @@ import torch
 import torch.distributed.checkpoint as dcp
 from torch import Tensor, nn
 from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
     get_model_state_dict,
     get_optimizer_state_dict,
     set_model_state_dict,
@@ -55,6 +56,7 @@ from torch.distributed.checkpoint.state_dict import (
 from ..config import PolicyConfig
 from .distributed import barrier, rank_world
 from .ema import PowerEMA
+from .lora import apply_lora, lora_settings, merge_lora
 
 STATE_FORMAT = 1
 COMPLETE_MARKER = "COMPLETE"
@@ -222,8 +224,10 @@ def save_checkpoint(
     emas: dict[str, PowerEMA],
     state: TrainState,
     config: PolicyConfig,
+    trainable_only: bool = False,
 ) -> Path:
-    """Write ``<root>/step-<step>``; every rank calls this. Existing directories are replaced."""
+    """Write ``<root>/step-<step>``; every rank calls this. Existing directories are replaced. ``trainable_only``
+    (LoRA) writes only the parameters that train: the frozen base is rebuilt from ``trunk_weights``."""
     rank, world_size = rank_world()
     path = checkpoint_dir(root, step)
     if rank == 0 and path.exists():
@@ -236,7 +240,8 @@ def save_checkpoint(
         name: {"sigma_rel": ema.sigma_rel, "last_step": ema.last_step, "n_tensors": len(ema.names)}
         for name, ema in emas.items()
     }
-    _dcp_save({"model": get_model_state_dict(model)}, path / "model")
+    options = StateDictOptions(ignore_frozen_params=trainable_only)
+    _dcp_save({"model": get_model_state_dict(model, options=options)}, path / "model")
     _dcp_save({"optimizer": get_optimizer_state_dict(model, optimizer)}, path / "optimizer")
     for name, ema in emas.items():
         _dcp_save({"tensors": ema.state_dict()["tensors"]}, path / name)
@@ -258,8 +263,10 @@ def load_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer | None = None,
     emas: dict[str, PowerEMA] | None = None,
+    trainable_only: bool = False,
 ) -> TrainState:
-    """Restore model, optimizer and EMA tensors in place (resharding as needed) and return the state."""
+    """Restore model, optimizer and EMA tensors in place (resharding as needed) and return the state.
+    ``trainable_only``: the checkpoint holds the trainable parameters only (LoRA); the rest stays as built."""
     path = Path(path)
     if not (path / COMPLETE_MARKER).exists():
         raise FileNotFoundError(f"{path} is not a complete checkpoint")
@@ -269,9 +276,10 @@ def load_checkpoint(
             "or resume from a newer checkpoint"
         )
     state = TrainState.from_json((path / "state.json").read_text())
-    model_sd = {"model": get_model_state_dict(model)}
+    options = StateDictOptions(ignore_frozen_params=trainable_only, strict=not trainable_only)
+    model_sd = {"model": get_model_state_dict(model, options=options)}
     _dcp_load(model_sd, path / "model")
-    set_model_state_dict(model, model_sd["model"])
+    set_model_state_dict(model, model_sd["model"], options=options)
     if optimizer is not None:
         optim_sd = {"optimizer": get_optimizer_state_dict(model, optimizer)}
         _dcp_load(optim_sd, path / "optimizer")
@@ -322,6 +330,9 @@ def export_policy(
     if profile != "model" and profile not in state.emas:
         raise ValueError(f"unknown profile {profile!r}; choose 'model' or one of {sorted(state.emas)}")
     config = PolicyConfig(**json.loads((path / "config.json").read_text()))
+    lora = lora_settings(state.extra.get("train_config", {}).get("lora"))
+    if lora is not None:
+        return _export_lora(path, output, state, config, lora, profile=profile, dtype=dtype)
     dit = build_action_dit(
         action_dit_params(
             restrict_content_streams(JointSingleSeqParams(**config.dit_config), config.content_streams),
@@ -349,4 +360,58 @@ def export_policy(
         "profile": profile,
         "output": str(output),
         "tensors": len(tensors),
+    }
+
+
+def _export_lora(
+    path: Path,
+    output,
+    state: TrainState,
+    config: PolicyConfig,
+    lora: dict,
+    *,
+    profile: str,
+    dtype: str | None,
+) -> dict[str, Any]:
+    """A LoRA checkpoint's export: the policy from ``trunk_weights`` plus the checkpoint's adapters (``model`` or an
+    EMA profile, which averages exactly the adapters), merged into plain linear layers."""
+    from ..models.runtime import TRUNK_WEIGHTS_FILENAME, resolve_weights
+    from ..models.transformer import JointSingleSeqParams
+    from ..models.wiring import action_dit_params, build_action_dit, restrict_content_streams
+    from ..policy import write_policy_export
+
+    if not config.trunk_weights:
+        raise ValueError(f"{path}: a LoRA checkpoint needs the policy's trunk_weights to export")
+    dit = build_action_dit(
+        action_dit_params(
+            restrict_content_streams(JointSingleSeqParams(**config.dit_config), config.content_streams),
+            config.action_modality,
+            config.action_dim,
+            attn_mode=config.attn_mode,
+            conditioning_channels=config.conditioning_channels,
+        ),
+        resolve_weights(config.trunk_weights, TRUNK_WEIGHTS_FILENAME),
+        modality=config.action_modality,
+        dtype=getattr(torch, config.torch_dtype),
+        head_seed=config.head_init_seed,
+    )
+    apply_lora(dit, lora["rank"], lora["alpha"], lora["mode_streams"])
+    adapters = {f"dit.{k}": v for k, v in dit.named_parameters() if ".lora_" in k}
+    if profile == "model":
+        _dcp_load({"model": adapters}, path / "model", partial=True)
+    else:
+        _dcp_load({"tensors": adapters}, path / profile)
+    merged = merge_lora(dit)
+    tensors: dict[str, Tensor] = {f"dit.{k}": v for k, v in dit.state_dict().items()}
+    if dtype is not None:
+        target = getattr(torch, dtype)
+        tensors = {k: (v.to(target) if v.is_floating_point() else v) for k, v in tensors.items()}
+    write_policy_export(output, config, tensors, weight_profile=profile)
+    return {
+        "checkpoint": str(path),
+        "step": state.step,
+        "profile": profile,
+        "output": str(output),
+        "tensors": len(tensors),
+        "lora_layers_merged": merged,
     }

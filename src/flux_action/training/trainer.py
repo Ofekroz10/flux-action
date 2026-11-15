@@ -71,6 +71,7 @@ from .distributed import (
     shard_dit,
 )
 from .ema import DROID_POWER_EMA_SIGMA_RELS, PowerEMA
+from .lora import apply_lora, lora_settings
 from .schedule import (
     DROID_COOLDOWN_START,
     DROID_COOLDOWN_STEPS,
@@ -156,6 +157,10 @@ class TrainConfig:
     # DSF (``flux_action.dsf``): {"masks_root": dsf_flux run folder, "run": "k0_ringrandom", "split": split.json},
     # read by the DSF dataset plugs. Their windows train with two noise levels (PolicyConfig.dsf_low_timesteps).
     dsf: dict[str, Any] | None = None
+    # LoRA (``flux_action.training.lora``): {"rank": 512, "alpha": 512, "mode_streams": ["video", "video_cond"]}.
+    # Adapters on the single-stream blocks and the mode blocks of ``mode_streams``; the rest of the DiT is frozen,
+    # checkpoints hold the adapters only and exports merge them into the base. None = full fine-tuning.
+    lora: dict[str, Any] | None = None
     # Held-out validation: a dataset plug like ``dataset`` ("pkg.module:callable", e.g.
     # "flux_action.dsf.dataset:build_validation"), run every ``validation_every`` updates on ``validation_batches``
     # batches per rank with seeded noise (comparable across validations; the training RNG is untouched). It logs the
@@ -164,6 +169,9 @@ class TrainConfig:
     validation_every: int | None = None
     validation_batches: int = 16
     validation_timesteps: tuple[float, ...] = (0.1, 0.3, 0.5, 0.7, 0.9)
+    # DSF validation at fixed (t_low, t_high) pairs as well, the same in every run (e.g. [[0.15, 0.95], [0.5, 0.55]]):
+    # logs val_dsf_tl<l>_th<h>_{loss,video_hidden_mse,action_hidden_mse}.
+    validation_dsf_levels: tuple[tuple[float, float], ...] = ()
     validate_at_start: bool = True
 
     def __post_init__(self):
@@ -171,6 +179,10 @@ class TrainConfig:
         self.betas = tuple(self.betas)
         self.ema_sigma_rels = tuple(self.ema_sigma_rels)
         self.validation_timesteps = tuple(float(t) for t in self.validation_timesteps)
+        self.validation_dsf_levels = tuple((float(low), float(high)) for low, high in self.validation_dsf_levels)
+        if any(not 0 <= low <= high <= 1 for low, high in self.validation_dsf_levels):
+            raise ValueError("validation_dsf_levels must be (t_low, t_high) pairs with 0 <= t_low <= t_high <= 1")
+        lora_settings(self.lora)
         if self.validation_every is not None and (self.validation_every < 1 or not self.validation_dataset):
             raise ValueError("validation_every needs a positive value and a validation_dataset")
         self.frozen_streams = tuple(self.frozen_streams)
@@ -275,6 +287,10 @@ class Trainer:
                 self.policy_factory(policy_config) if self.policy_factory else _default_policy(policy_config)
             )
         frozen = policy.freeze_streams(cfg.frozen_streams) + policy.freeze_conditioning_heads()
+        self.lora = lora_settings(cfg.lora)
+        if self.lora is not None:
+            wrapped = apply_lora(policy.dit, self.lora["rank"], self.lora["alpha"], self.lora["mode_streams"])
+            self._log_line({"event": "lora", **self.lora, "layers": len(wrapped)})
         self._log_line(
             {
                 "event": "frozen",
@@ -319,7 +335,7 @@ class Trainer:
                 frozen_steps=cfg.frozen_steps,
                 trunk_warmup_steps=cfg.trunk_warmup_steps,
                 heads_warmup_steps=cfg.heads_warmup_steps,
-            ),
+            )[: len(self.optimizer.param_groups)],  # LoRA: the heads are frozen, one group (the adapters)
         )
         self.emas = {ema_folder(s): PowerEMA.from_module(policy, s) for s in cfg.ema_sigma_rels}
         self.state = TrainState(run_seed=cfg.seed, world_size=self.world_size)
@@ -478,7 +494,9 @@ class Trainer:
         if path is None:
             return
         self._validate_resume_contract(path)
-        self.state = load_checkpoint(path, model=self.policy, optimizer=self.optimizer, emas=self.emas)
+        self.state = load_checkpoint(
+            path, model=self.policy, optimizer=self.optimizer, emas=self.emas, trainable_only=self.lora is not None
+        )
         self.state.extra["data_contract"] = self._data_contract()
         self.step = self.state.step
         if cfg.seed != self.state.run_seed and not cfg.allow_seed_change:
@@ -821,7 +839,12 @@ class Trainer:
             in_process=cfg.in_process_loader,
         )
         dsf_keys = DSF_METRICS if cfg.dsf else ()
-        names = ["loss", "video_mse", "action_mse", *dsf_keys, *(f"loss_t{t:g}" for t in cfg.validation_timesteps)]
+        pairs = cfg.validation_dsf_levels if cfg.dsf else ()
+        pair_keys = ("loss", "dsf_video_hidden_mse", "dsf_action_hidden_mse")
+        names = [
+            "loss", "video_mse", "action_mse", *dsf_keys, *(f"loss_t{t:g}" for t in cfg.validation_timesteps),
+            *(f"dsf_tl{low:g}_th{high:g}_{key.removeprefix('dsf_')}" for low, high in pairs for key in pair_keys),
+        ]
         sums = torch.zeros(len(names), device=self.device, dtype=torch.float64)
         autocast = torch.autocast(
             self.device.type,
@@ -843,7 +866,14 @@ class Trainer:
                             self.policy(batch, prepared=prepared, fixed_timestep=t)[0]
                             for t in cfg.validation_timesteps
                         ]
-                row = [loss, info["video_mse"], info["action_mse"], *(info.get(k, 0.0) for k in dsf_keys), *fixed]
+                        at_pairs = []
+                        for pair in pairs:
+                            pair_loss, pair_info = self.policy(batch, prepared=prepared, dsf_levels=pair)
+                            at_pairs += [pair_loss, pair_info["dsf_video_hidden_mse"], pair_info["dsf_action_hidden_mse"]]
+                row = [
+                    loss, info["video_mse"], info["action_mse"], *(info.get(k, 0.0) for k in dsf_keys), *fixed,
+                    *at_pairs,
+                ]
                 sums += torch.stack([torch.as_tensor(v, device=self.device, dtype=torch.float64) for v in row])
         finally:
             self.policy.train()
@@ -870,6 +900,7 @@ class Trainer:
             emas=self.emas,
             state=self.state,
             config=self.policy.config,
+            trainable_only=self.lora is not None,
         )
         if self.rank == 0:
             self._log_line(

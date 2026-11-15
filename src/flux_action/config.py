@@ -137,6 +137,12 @@ class PolicyConfig:
     # every predicted token and t_high ~ U[t_low, 1] for the hidden ones. ``uniform``: t_low ~ U[0, 1]; ``recipe``:
     # t_low from train_timestep_width / train_timestep_shift. Windows without DSF masks are unaffected.
     dsf_low_timesteps: str = "uniform"
+    # Strong-signal DSF draws (the LTX WAM run-2 rule): this fraction of DSF windows takes t_low ~ U[dsf_strong_t_low]
+    # and t_high ~ U[dsf_strong_t_high] (the hidden robot near pure noise, the rest nearly clean); the others keep
+    # the rule above. Ordinary windows (``dsf_ordinary``) take the policy's own single level instead.
+    dsf_strong_fraction: float = 0.0
+    dsf_strong_t_low: tuple[float, float] = (0.1, 0.2)
+    dsf_strong_t_high: tuple[float, float] = (0.9, 0.99)
     loss_reduction: str = "joint_tokens"
     action_channel_weights: list[float] | None = None
     action_loss_weight: float = 50.0
@@ -170,6 +176,13 @@ class PolicyConfig:
             raise ValueError("loss_reduction must be joint_tokens or modalities")
         if self.dsf_low_timesteps not in ("uniform", "recipe"):
             raise ValueError("dsf_low_timesteps must be uniform or recipe")
+        self.dsf_strong_t_low = tuple(float(x) for x in self.dsf_strong_t_low)
+        self.dsf_strong_t_high = tuple(float(x) for x in self.dsf_strong_t_high)
+        if not 0 <= self.dsf_strong_fraction <= 1:
+            raise ValueError("dsf_strong_fraction must be between zero and one")
+        (low_a, low_b), (high_a, high_b) = self.dsf_strong_t_low, self.dsf_strong_t_high
+        if not 0 <= low_a <= low_b <= high_a <= high_b <= 1:
+            raise ValueError("dsf_strong_t_low and dsf_strong_t_high must be ordered ranges in [0, 1]")
         if not 0 <= self.conditioning_noise_max <= 1:
             raise ValueError("conditioning_noise_max must be between zero and one")
         if (

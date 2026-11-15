@@ -188,6 +188,7 @@ class PreparedWindows:
     # DSF (``flux_action.dsf``): per window the predicted video tokens (t h w order) and action tokens at t_high
     dsf_video_high: Tensor | None = None  # (n, latent frames x h x w) bool
     dsf_action_high: Tensor | None = None  # (n, chunk) bool
+    dsf_ordinary: Tensor | None = None  # (n,) bool: DSF-batch windows that hide nothing and train at one level
     event: Any = None
 
     def tensors(self):
@@ -202,6 +203,7 @@ class PreparedWindows:
         if self.dsf_video_high is not None:
             yield self.dsf_video_high
             yield self.dsf_action_high
+            yield self.dsf_ordinary
 
 
 class FluxActionPolicy(nn.Module):
@@ -681,7 +683,7 @@ class FluxActionPolicy(nn.Module):
             for i in idx_keep
         ]  # drawn in window order, as _encode_windows always did
         latents = self._encode_windows(cams, idx_keep, device, augmentations, dropped)  # (n, 96, frames, h, w)
-        dsf_video, dsf_action = self._dsf_masks(batch, idx_keep, augmentations, latents.shape, device)
+        dsf_video, dsf_action, dsf_ordinary = self._dsf_masks(batch, idx_keep, augmentations, latents.shape, device)
         # Optional per-window action mask (B, D): a dataset that pools embodiments of different action widths
         # into one head pads the narrow ones and masks the padding out of the loss.
         mask = batch.get("action_mask")
@@ -700,6 +702,7 @@ class FluxActionPolicy(nn.Module):
             action_prefix_lengths=prefixes,
             dsf_video_high=dsf_video,
             dsf_action_high=dsf_action,
+            dsf_ordinary=dsf_ordinary,
         )
 
     def _dsf_masks(
@@ -709,11 +712,12 @@ class FluxActionPolicy(nn.Module):
         augmentations: list[dict | None],
         latent_shape: torch.Size,
         device: torch.device,
-    ) -> tuple[Tensor | None, Tensor | None]:
+    ) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
         """DSF windows (``dsf_union`` in the batch): the hidden-camera pixel masks -> per-window token masks
-        ``(n, frames x h x w)`` and ``(n, chunk)``, after each window's own crop augmentation. ``(None, None)`` otherwise."""
+        ``(n, frames x h x w)`` and ``(n, chunk)``, after each window's own crop augmentation, and ``(n,)`` which
+        windows are ordinary (``dsf_ordinary``: nothing hidden, one noise level). ``(None, None, None)`` otherwise."""
         if "dsf_union" not in batch:
-            return None, None
+            return None, None, None
         from .dsf import masks as dsf_masks
 
         cfg = self.config
@@ -733,6 +737,9 @@ class FluxActionPolicy(nn.Module):
         ring = torch.as_tensor(batch["dsf_random_ring"]).tolist()
         episodes = torch.as_tensor(batch["dsf_episode_index"]).tolist()
         starts = torch.as_tensor(batch["dsf_start"]).tolist()
+        size = len(hidden)
+        all_actions = torch.as_tensor(batch.get("dsf_all_actions", [False] * size)).tolist()
+        ordinary = torch.as_tensor(batch.get("dsf_ordinary", [False] * size), dtype=torch.bool)[idx]
         video, action = [], []
         for i, augmentation in zip(idx, augmentations, strict=True):
             v, a = dsf_masks.window_token_masks(
@@ -743,10 +750,17 @@ class FluxActionPolicy(nn.Module):
                 random_ring=bool(ring[i]),
                 episode_index=episodes[i],
                 start=starts[i],
+                all_actions_high=bool(all_actions[i]),
             )
             video.append(torch.from_numpy(v.reshape(-1)))
             action.append(torch.from_numpy(a))
-        return torch.stack(video).to(device, non_blocking=True), torch.stack(action).to(device, non_blocking=True)
+        if bool((ordinary & torch.stack(video).any(1)).any()):
+            raise ValueError("an ordinary DSF window carries hidden tokens")
+        return (
+            torch.stack(video).to(device, non_blocking=True),
+            torch.stack(action).to(device, non_blocking=True),
+            ordinary.to(device, non_blocking=True),
+        )
 
     def _rtc_prefix_lengths(self, batch: dict[str, Any], batch_size: int) -> Tensor | None:
         """Per-window RTC prefix lengths ``(B,)``: ``rtc_prefix_lengths`` from the batch when given, else drawn
@@ -791,10 +805,12 @@ class FluxActionPolicy(nn.Module):
         prepared: PreparedWindows | None = None,
         *,
         fixed_timestep: float | None = None,
+        dsf_levels: tuple[float, float] | None = None,
     ) -> tuple[Tensor, dict[str, Any]]:
         """Training loss of a micro-batch; ``prepared`` is the output of :meth:`prepare` for this batch
         (computed here when not given). DSF windows get two noise levels (``flux_action.dsf.noise``);
-        ``fixed_timestep`` instead noises every predicted token of every window at that one level (validation)."""
+        ``fixed_timestep`` instead noises every predicted token of every window at that one level, ``dsf_levels``
+        gives every DSF window the same ``(t_low, t_high)`` (validation)."""
         cfg = self.config
         if prepared is None:
             prepared = self.prepare(batch)
@@ -831,9 +847,19 @@ class FluxActionPolicy(nn.Module):
                 raise ValueError("DSF windows draw their own two levels; separate_timesteps must be off")
             from .dsf import noise as dsf_noise
 
-            low, high = dsf_noise.draw_levels(
-                n, cfg.dsf_low_timesteps, width=cfg.train_timestep_width, shift=cfg.train_timestep_shift
-            )
+            if dsf_levels is not None:
+                low, high = torch.full((n,), float(dsf_levels[0])), torch.full((n,), float(dsf_levels[1]))
+            else:
+                low, high = dsf_noise.draw_levels(
+                    n,
+                    cfg.dsf_low_timesteps,
+                    width=cfg.train_timestep_width,
+                    shift=cfg.train_timestep_shift,
+                    strong_fraction=cfg.dsf_strong_fraction,
+                    strong_low=cfg.dsf_strong_t_low,
+                    strong_high=cfg.dsf_strong_t_high,
+                    ordinary=prepared.dsf_ordinary,
+                )
             timesteps, action_timesteps = dsf_noise.token_timesteps(
                 low, high, prepared.dsf_video_high, prepared.dsf_action_high
             )

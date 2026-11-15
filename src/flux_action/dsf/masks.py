@@ -109,12 +109,15 @@ def window_token_masks(
     episode_index: int = 0,
     start: int = 0,
     probability: float = RING_CELL_PROBABILITY,
+    all_actions_high: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """A window's masks: ``union`` (8, PACKED_BYTES) the hidden camera's packed pixel mask per predicted latent frame
     (the OR of its 4 frames), ``block_high`` (8,) which of them hold one. Returns ``video`` (8, 17, 20) bool (token
     order t, h, w) and ``action`` (32,) bool: a latent frame's 4 actions are high if it hides at least one token.
     The cells follow ``augmentation``; the random ring (one field per window, shared by its 8 latent frames) is drawn
-    after the crop and never changes which actions are high."""
+    after the crop and never changes which actions are high. ``all_actions_high`` (whole-window hiding): all 32 actions
+    are high as soon as the window hides one token, since clean absolute joint positions would let the model draw the
+    hidden robot without the other camera."""
     video = np.zeros((PREDICTED_BLOCKS, *LATENT_HW), bool)
     action = np.zeros(CHUNK, bool)
     field = ring_field(episode_index, start, camera) if random_ring else None
@@ -124,4 +127,6 @@ def window_token_masks(
         cells = camera_cells(augment_support(unpack_camera_mask(union[j]), augmentation), camera)
         video[j] = add_random_ring(cells, field, camera, probability) if random_ring else cells
         action[BLOCK_FRAMES * j : BLOCK_FRAMES * (j + 1)] = cells.any()
+    if all_actions_high:
+        action[:] = video.any()
     return video, action

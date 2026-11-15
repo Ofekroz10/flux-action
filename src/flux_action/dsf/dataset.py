@@ -8,8 +8,15 @@ handled object are hidden, the other one being the clean reference. Its windows 
 index's valid starts) that are multiples of 4, so every latent frame is one ``dsf_flux`` block, whose 8 blocks hide
 at least one cell (exact cells, before augmentation), and whose future holds a gripper close: the commanded gripper
 crosses ``CLOSE_THRESHOLD`` upward between action steps ``CLOSE_STEPS`` (8-27 of 32: 0.53-1.8 s at 15 Hz), so the
-approach before the grasp and its outcome after it are both in the window. Every DSF sample is one of these windows;
-other windows are not used. An epoch visits every unit ``visits_per_epoch`` times and draws one of its windows per visit,
+approach before the grasp and its outcome after it are both in the window. Every DSF sample is one of these windows,
+except ordinary ones. With ``whole_window`` a window must also have a mask for all 8 of its latent frames (masks made
+for whole-window hiding: the robot hidden in that camera through the whole predicted future, so nothing in the same
+camera shows it a moment before or after), and its 32 actions are all at t_high (``dsf_all_actions``): clean absolute
+joint positions would let the model draw the hidden robot from the joints instead of from the other camera.
+
+``ordinary_fraction`` (training only) turns that share of the visits into ordinary windows: any valid start of the
+unit's episode, nothing hidden (``dsf_ordinary``), one noise level from the policy's own distribution. They keep the
+regular video and action prediction trained next to the DSF windows. An epoch visits every unit ``visits_per_epoch`` times and draws one of its windows per visit,
 seeded by (run seed, epoch, episode, camera, visit), like the index loader draws one window per episode.
 
 The masks: ``<masks_root>/ep_<episode_index>/blocks_<run>.npz`` (``dsf_flux/plan.py``). Per window the dataset attaches
@@ -94,9 +101,14 @@ class DSFWindowDataset(WindowDataset):
         run: str,
         episodes: set[int],
         visits_per_epoch: int = 1,
+        whole_window: bool = False,
+        ordinary_fraction: float = 0.0,
         **loader: Any,
     ):
+        if not 0 <= ordinary_fraction < 1:
+            raise ValueError("ordinary_fraction must be in [0, 1)")
         self.masks_root, self.run = Path(masks_root), run
+        self.whole_window, self.ordinary_fraction = bool(whole_window), float(ordinary_fraction)
         chunk = int(manifest["chunk_size"])
         if chunk != masks.CHUNK:
             raise ValueError(f"DSF windows hold {masks.CHUNK} actions, the index {chunk}")
@@ -132,6 +144,10 @@ class DSFWindowDataset(WindowDataset):
                     for s in starts
                     if s // masks.BLOCK_FRAMES + masks.PREDICTED_BLOCKS <= len(block_high)
                     and cells[camera][s // masks.BLOCK_FRAMES : s // masks.BLOCK_FRAMES + masks.PREDICTED_BLOCKS].any()
+                    and (
+                        not self.whole_window
+                        or block_high[s // masks.BLOCK_FRAMES : s // masks.BLOCK_FRAMES + masks.PREDICTED_BLOCKS].all()
+                    )
                 ]
                 any_hidden = any_hidden or bool(noisy)
                 chosen = [s for s in noisy if s in closing]
@@ -159,11 +175,29 @@ class DSFWindowDataset(WindowDataset):
         episode = self.episodes[episode_position]
         index = int(episode["episode_index"])
         rng = Random(f"dsf:{self.seed}:{self.epoch}:{index}:{hidden}:{visit}")
-        start = starts[rng.randrange(len(starts))]
+        ordinary = self.ordinary_fraction > 0 and rng.random() < self.ordinary_fraction
+        if ordinary:
+            every = self.valid_starts(episode_position)
+            start = every[rng.randrange(len(every))]
+        else:
+            start = starts[rng.randrange(len(starts))]
         task = select_caption(episode["caption"], rng)
         item = self.window_at(episode_position, start, task=task, window_seed=rng.getrandbits(63))
-        item.update(self.window_masks(index, hidden, start))
+        item.update(self.ordinary_masks(index, hidden, start) if ordinary else self.window_masks(index, hidden, start))
         return item
+
+    def ordinary_masks(self, episode_index: int, hidden: int, start: int) -> dict[str, Any]:
+        """The DSF fields of an ordinary window: nothing hidden."""
+        return {
+            "dsf_union": torch.zeros(masks.PREDICTED_BLOCKS, masks.PACKED_BYTES, dtype=torch.uint8),
+            "dsf_block_high": torch.zeros(masks.PREDICTED_BLOCKS, dtype=torch.bool),
+            "dsf_hidden": hidden,
+            "dsf_random_ring": False,
+            "dsf_episode_index": episode_index,
+            "dsf_start": start,
+            "dsf_all_actions": False,
+            "dsf_ordinary": True,
+        }
 
     def window_masks(self, episode_index: int, hidden: int, start: int) -> dict[str, Any]:
         """The DSF fields of a window (see the module docstring)."""
@@ -191,6 +225,8 @@ class DSFWindowDataset(WindowDataset):
             "dsf_random_ring": random_ring,
             "dsf_episode_index": episode_index,
             "dsf_start": start,
+            "dsf_all_actions": self.whole_window,
+            "dsf_ordinary": False,
         }
 
 
@@ -203,6 +239,9 @@ def _build(config, split: str, **loader: Any) -> DSFWindowDataset:
             raise ValueError(f"TrainConfig.dsf needs {key!r} for the DSF dataset")
     episodes = set(json.loads(Path(settings["split"]).read_text())[split])
     index = Path(config.index_dir)
+    unknown = set(settings) - {"masks_root", "run", "split", "whole_window", "ordinary_fraction"}
+    if unknown:
+        raise ValueError(f"unknown TrainConfig.dsf settings {sorted(unknown)}")
     loader.pop("n_obs_steps", None)
     return DSFWindowDataset(
         load_manifest(index / "manifest.json"),
@@ -212,6 +251,9 @@ def _build(config, split: str, **loader: Any) -> DSFWindowDataset:
         run=settings["run"],
         episodes=episodes,
         visits_per_epoch=config.visits_per_epoch,
+        whole_window=bool(settings.get("whole_window", False)),
+        # validation always measures the DSF windows themselves
+        ordinary_fraction=float(settings.get("ordinary_fraction", 0.0)) if split == "train" else 0.0,
         decoder=config.decoder,
         frame_hw=config.frame_hw,
         **loader,

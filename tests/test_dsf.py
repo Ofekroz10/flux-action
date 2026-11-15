@@ -23,6 +23,7 @@ from flux_action.dsf.dataset import (
 from flux_action.models.text_encoder import MockTextEncoder
 from flux_action.policy import FluxActionPolicy
 from flux_action.processing import packing
+from flux_action.training.data import collate_windows
 from flux_action.training.trainer import DSF_METRICS, TrainConfig, Trainer
 
 NEUTRAL = {"color_fn_order": [0, 1, 2, 3], "brightness_factor": 1.0, "contrast_factor": 1.0,
@@ -340,6 +341,7 @@ def test_trainer_logs_progress_dsf_metrics_and_validation(tmp_path):
         heads_warmup_steps=1, windows_per_rank=2, num_workers=1, in_process_loader=True, param_dtype="float32",
         compute_dtype="float32", checkpoint_every=100, log_every=1, ema_sigma_rels=(0.10,),
         validation_every=1, validation_batches=1, validation_timesteps=(0.5,),
+        validation_dsf_levels=[[0.15, 0.95]],
     )
     Trainer(config, policy_factory=lambda c: FluxActionPolicy(c, video_vae=FakeVideoVAE(),
                                                               text_encoder=MockTextEncoder(32))).run()
@@ -351,5 +353,59 @@ def test_trainer_logs_progress_dsf_metrics_and_validation(tmp_path):
     assert all(np.isfinite(updates[0][k]) for k in DSF_METRICS) and updates[0]["dsf_t_low"] <= updates[0]["dsf_t_high"]
     assert [v["step"] for v in validations] == [0, 1, 2]                 # baseline, then every update
     assert {"val_loss", "val_dsf_video_hidden_mse", "val_dsf_action_hidden_mse", "val_loss_t0.5"} <= set(validations[0])
+    pair = {f"val_dsf_tl0.15_th0.95_{k}" for k in ("loss", "video_hidden_mse", "action_hidden_mse")}
+    assert pair <= set(validations[0]) and all(np.isfinite(validations[0][k]) for k in pair)
     epoch = next(r for r in lines if r.get("event") == "epoch")
     assert epoch["dataset_episodes"] == 2 and epoch["dataset_positions"] == 4
+
+
+def test_strong_levels_ordinary_windows_and_all_actions_high():
+    generator = torch.Generator().manual_seed(0)
+    ordinary = torch.zeros(4000, dtype=torch.bool)
+    ordinary[:1000] = True
+    low, high = noise.draw_levels(4000, "uniform", width=0.75, shift=42.0, generator=generator, strong_fraction=0.7,
+                                  ordinary=ordinary)
+    assert (low[:1000] == high[:1000]).all() and low[:1000].median() > 0.9      # one level, the policy's own
+    dsf_low, dsf_high = low[1000:], high[1000:]
+    strong = (dsf_low >= 0.1) & (dsf_low <= 0.2) & (dsf_high >= 0.9) & (dsf_high <= 0.99)
+    assert 0.65 < strong.float().mean() < 0.8 and (dsf_low <= dsf_high).all()
+    union, block_high = window_union({2: patch(100, 200, 160, 260)})
+    _, action = masks.window_token_masks(union, block_high, "ext1", all_actions_high=True)
+    assert action.all()                                                          # the joints would be a shortcut
+    _, nothing = masks.window_token_masks(*window_union({2: np.zeros(masks.CAMERA_HW, bool)}), "ext1",
+                                          all_actions_high=True)
+    assert not nothing.any()                                                     # nothing hidden, nothing high
+
+
+def test_whole_window_and_ordinary_windows(dsf_index, tmp_path):
+    root, manifest = dsf_index
+    masks_root = tmp_path / "masks"
+    every_block = {b: (100, 200 + 4 * b, 150, 260 + 4 * b) for b in range(30)}   # robot masks for every latent frame
+    write_blocks(masks_root, 0, 121, every_block)
+    write_blocks(masks_root, 1, 121, {10: (100, 200, 150, 260), 11: (100, 210, 150, 270)})  # around an event only
+    for e in (2, 3):
+        write_blocks(masks_root, e, 121, every_block)
+    whole = DSFWindowDataset(manifest, root / "source", root / "index" / ROWS_FILENAME, masks_root=masks_root,
+                             run="k0_ringrandom", episodes={0, 1}, seed=1, frame_hw=(32, 64), decoder="pyav",
+                             whole_window=True, ordinary_fraction=0.5, visits_per_epoch=40)
+    assert [int(e["episode_index"]) for e in whole.episodes] == [0]
+    assert whole.skipped == {1: "no window with a hidden cell"}                  # partial masks: no whole window
+    assert whole.units[0][2] == [36, 40, 44, 48, 52]                              # the close at frame 60
+    kinds = []
+    for position in range(whole.n_positions):
+        item = whole.window(position)
+        kinds.append(item["dsf_ordinary"])
+        if item["dsf_ordinary"]:
+            assert not item["dsf_block_high"].any() and not item["dsf_union"].any() and not item["dsf_all_actions"]
+            assert item["start"] in whole.valid_starts(0)
+        else:
+            assert item["start"] in whole.units[0][2] and item["dsf_block_high"].all() and item["dsf_all_actions"]
+    assert 0.3 < np.mean(kinds) < 0.7
+    policy = droid_policy()
+    chosen = [kinds.index(True), kinds.index(True, kinds.index(True) + 1), kinds.index(False), kinds.index(False, kinds.index(False) + 1)]
+    batch = collate_windows([whole.window(p) for p in chosen])
+    prepared = policy.prepare(batch)
+    ordinary = torch.tensor([bool(o) for o in batch["dsf_ordinary"]])
+    assert prepared.dsf_ordinary.tolist() == ordinary.tolist()
+    assert prepared.dsf_action_high.all(1).tolist() == (~ordinary).tolist()
+    assert not prepared.dsf_video_high[ordinary].any()

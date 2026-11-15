@@ -1,0 +1,126 @@
+{
+  "source_root": "outputs/dsf/source",
+  "index_dir": "outputs/dsf/index",
+  "output_dir": "outputs/dsf/run-pilot-lora",
+  "dataset": "flux_action.dsf.dataset:build_train",
+  "validation_dataset": "flux_action.dsf.dataset:build_validation",
+  "dsf": {
+    "masks_root": "outputs/dsf/masks",
+    "run": "k0_ringrandom",
+    "split": "outputs/dsf/masks/split.json",
+    "whole_window": true,
+    "ordinary_fraction": 0.3
+  },
+  "policy": {
+    "action_dim": 8,
+    "action_modality": "action_prediction_droid",
+    "camera_layout": "droid",
+    "camera_keys": [
+      "images.wrist",
+      "images.left",
+      "images.right"
+    ],
+    "canvas_hw": [
+      544,
+      736
+    ],
+    "chunk_size": 32,
+    "n_action_steps": 32,
+    "fps": 15.0,
+    "action_scale": 2.0,
+    "gripper_flip_dims": [
+      -1
+    ],
+    "action_parameterization": "absolute",
+    "content_streams": [
+      "video",
+      "video_cond"
+    ],
+    "trunk_weights": "outputs/droid/model.safetensors",
+    "video_vae_id": "black-forest-labs/flux-3-action-base:video_vae.safetensors@62878e2925e59b7a89ec14463ce89932624c490d",
+    "text_encoder_id": "black-forest-labs/flux-3-action-base:text_encoder@62878e2925e59b7a89ec14463ce89932624c490d",
+    "attn_mode": "torch",
+    "train_timestep_width": 0.75,
+    "train_timestep_shift": 42.0,
+    "dsf_low_timesteps": "uniform",
+    "action_loss_weight": 50.0,
+    "video_loss_weight": 1.0,
+    "caption_dropout": 0.1,
+    "augment": true,
+    "vae_batch_windows": 8,
+    "optimizer_lr": 0.0001,
+    "optimizer_lr_heads_multiplier": 1.0,
+    "dsf_strong_fraction": 0.7,
+    "dsf_strong_t_low": [
+      0.1,
+      0.2
+    ],
+    "dsf_strong_t_high": [
+      0.9,
+      0.99
+    ]
+  },
+  "steps": 1020,
+  "cooldown_start": 816,
+  "cooldown_steps": 204,
+  "frozen_steps": 0,
+  "trunk_warmup_steps": 50,
+  "heads_warmup_steps": 50,
+  "seed": 42,
+  "reseed_on_resume": true,
+  "windows_per_rank": 8,
+  "grad_accumulation": 8,
+  "num_workers": 8,
+  "prefetch_factor": 2,
+  "decoder": "ffmpeg",
+  "shard_size": null,
+  "param_dtype": "bfloat16",
+  "compute_dtype": "bfloat16",
+  "reduce_dtype": "float32",
+  "activation_checkpointing": true,
+  "reshard_after_forward": true,
+  "betas": [
+    0.9,
+    0.99
+  ],
+  "eps": 1e-08,
+  "weight_decay": 0.05,
+  "fused_optimizer": true,
+  "max_grad_norm": 1.0,
+  "ema_sigma_rels": [
+    0.1
+  ],
+  "checkpoint_every": 100,
+  "keep_checkpoints": 3,
+  "keep_every": 200,
+  "log_every": 5,
+  "validation_every": 50,
+  "validation_batches": 8,
+  "validation_timesteps": [
+    0.1,
+    0.3,
+    0.5,
+    0.7,
+    0.9
+  ],
+  "validate_at_start": true,
+  "resume": "auto",
+  "lora": {
+    "rank": 512,
+    "alpha": 512,
+    "mode_streams": [
+      "video",
+      "video_cond"
+    ]
+  },
+  "validation_dsf_levels": [
+    [
+      0.15,
+      0.95
+    ],
+    [
+      0.5,
+      0.55
+    ]
+  ]
+}
