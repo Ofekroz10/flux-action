@@ -127,7 +127,7 @@ def build_compact_dataset(root, episodes, frame_hw=FRAME_HW):
                     "timestamp": np.float32(i) / np.float32(FPS),
                     "task_index": captions.index(caption),
                     "action.joint_position": [float(e) + 100 + i / 1000] * 7,
-                    "action.gripper_position": [0.75],
+                    "action.gripper_position": [episode["gripper"][i] if "gripper" in episode else 0.75],
                     "observation.state.joint_positions": [float(e) + i / 1000] * 7,
                     "observation.state.gripper_position": [0.25],
                     "action.cartesian_position": cartesian_pose(e, i + 1),

@@ -13,7 +13,13 @@ from torch.utils.data import IterableDataset
 
 from flux_action.data.droid.index import ROWS_FILENAME, build_manifest, build_rows, write_manifest
 from flux_action.dsf import masks, noise
-from flux_action.dsf.dataset import DSFWindowDataset, write_split
+from flux_action.dsf.dataset import (
+    DSFWindowDataset,
+    close_starts,
+    close_steps,
+    count_close_windows,
+    write_split,
+)
 from flux_action.models.text_encoder import MockTextEncoder
 from flux_action.policy import FluxActionPolicy
 from flux_action.processing import packing
@@ -224,6 +230,9 @@ def write_blocks(root, episode_index, n_frames, high: dict[int, tuple], random_r
 def dsf_index(tmp_path_factory):
     root = tmp_path_factory.mktemp("dsf")
     episodes = [{"n_frames": 121, "caption": f"task {e}", "keep": [[0, 121]]} for e in range(4)]
+    closes = {0: 60, 2: 60}  # the commanded gripper closes at this frame; episodes 1 and 3 never close
+    for e, frame in closes.items():
+        episodes[e]["gripper"] = [0.0] * frame + [1.0] * (121 - frame)
     filter_path = build_compact_dataset(root / "source", episodes)
     manifest = build_manifest(root / "source", filter_path)
     (root / "index").mkdir()
@@ -246,25 +255,47 @@ def dataset(root, manifest, episodes, **kwargs):
 def test_dsf_dataset_draws_noisy_windows_with_their_masks(dsf_index):
     root, manifest = dsf_index
     data = dataset(root, manifest, {0, 1, 2, 3})
-    assert sorted(int(e["episode_index"]) for e in data.episodes) == [0, 1]   # 2: nothing seen, 3: no masks
-    assert data.skipped == {2: "no window with a hidden cell", 3: "no masks"}
-    assert [(data.episodes[p]["episode_index"], hidden) for p, hidden, _ in data.units] == [(0, 0), (1, 0)]
-    starts = data.units[0][2]
-    assert all(s % 4 == 0 for s in starts) and starts == [s for s in range(12, 45, 4)]  # blocks 10-11 in window
+    assert sorted(int(e["episode_index"]) for e in data.episodes) == [0]
+    assert data.skipped == {
+        1: "no gripper close in a hidden window",  # block 3 hidden, but the gripper never closes
+        2: "no window with a hidden cell",  # high, but nothing seen
+        3: "no masks",
+    }
+    assert [(data.episodes[p]["episode_index"], hidden) for p, hidden, _ in data.units] == [(0, 0)]
+    # blocks 10-11 in the window (starts 12..44) AND the close at frame 60 at action step 8..27 (starts 33..52)
+    assert data.units[0][2] == [36, 40, 44]
     for position in range(data.n_positions):
         item = data.window(position)
         unit = data.units[position % len(data.units)]
         assert item["start"] in unit[2] and item["dsf_start"] == item["start"]
         first = item["start"] // 4
         high = item["dsf_block_high"].numpy()
-        expected = [first + j in ({10, 11} if item["episode_index"] == 0 else {3}) for j in range(8)]
+        expected = [first + j in {10, 11} for j in range(8)]
         assert high.tolist() == expected and item["images.left"].shape == (33, 3, 32, 64)
         j = expected.index(True)
         assert masks.unpack_camera_mask(item["dsf_union"][j].numpy()).any()
     again = dataset(root, manifest, {0, 1, 2, 3})
     assert [again.window(p)["start"] for p in range(2)] == [data.window(p)["start"] for p in range(2)]
-    only = dataset(root, manifest, {1})
-    assert [int(e["episode_index"]) for e in only.episodes] == [1]
+    only = dataset(root, manifest, {0})
+    assert [int(e["episode_index"]) for e in only.episodes] == [0]
+
+
+def test_close_rule_keeps_windows_closing_the_gripper_at_steps_8_to_27():
+    gripper = np.array([0.2] * 40 + [0.9] * 20 + [0.1] * 10 + [0.6] * 10, np.float32)  # closes at 40 and 70
+    assert close_steps(gripper).tolist() == [40, 70]
+    assert close_steps(np.full(50, 0.9)).tolist() == []  # closed from the start: no close event
+    starts = list(range(0, 49, 4))
+    # 40: starts 13..32; 70: starts 43..62 (only <= 48 exist here)
+    assert close_starts(gripper, starts) == [16, 20, 24, 28, 32, 44, 48]
+
+
+def test_count_close_windows_on_the_data_files(dsf_index):
+    root, _ = dsf_index
+    totals = count_close_windows(root / "source", root / "source" / "keep_ranges.json")
+    # 4 episodes x 23 starts (0..88 step 4); closes at frame 60 in episodes 0 and 2: starts 36..52 -> 5 each
+    assert totals == {
+        "episodes": 4, "episodes_with_close_window": 2, "closes": 2, "windows": 92, "close_windows": 10,
+    }
 
 
 def test_split_and_length_check(dsf_index, tmp_path):

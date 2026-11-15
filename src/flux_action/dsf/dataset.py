@@ -5,15 +5,20 @@
 
 A DSF unit is (episode, hidden camera): the camera ext1 (``images.left``) or ext2 (``images.right``) whose robot and
 handled object are hidden, the other one being the clean reference. Its windows are the starts FLUX may draw (the
-index's valid starts) that are multiples of 4, so every latent frame is one ``dsf_flux`` block, and whose 8 blocks hide
-at least one cell (exact cells, before augmentation). Every DSF sample is one of these windows; windows without a hidden
-cell are not used. An epoch visits every unit ``visits_per_epoch`` times and draws one of its windows per visit,
+index's valid starts) that are multiples of 4, so every latent frame is one ``dsf_flux`` block, whose 8 blocks hide
+at least one cell (exact cells, before augmentation), and whose future holds a gripper close: the commanded gripper
+crosses ``CLOSE_THRESHOLD`` upward between action steps ``CLOSE_STEPS`` (8-27 of 32: 0.53-1.8 s at 15 Hz), so the
+approach before the grasp and its outcome after it are both in the window. Every DSF sample is one of these windows;
+other windows are not used. An epoch visits every unit ``visits_per_epoch`` times and draws one of its windows per visit,
 seeded by (run seed, epoch, episode, camera, visit), like the index loader draws one window per episode.
 
 The masks: ``<masks_root>/ep_<episode_index>/blocks_<run>.npz`` (``dsf_flux/plan.py``). Per window the dataset attaches
 ``dsf_union`` (8, 28800) uint8 (the hidden camera's packed 360x640 mask per latent frame, zeros when not high),
 ``dsf_block_high`` (8,), ``dsf_hidden`` (0 ext1, 1 ext2), ``dsf_random_ring``, ``dsf_episode_index``, ``dsf_start``;
 the policy turns them into token masks after the window's own crop augmentation (``flux_action.dsf.masks``).
+
+``python -m flux_action.dsf.dataset count <source_root> <keep_ranges.json>`` counts these windows (close rule only) on
+the Cosmos3-DROID data and meta files, without videos or masks.
 
 The split, by episode (``python -m flux_action.dsf.dataset split <masks_root> --validation 0.1 --seed 2026``), is a
 JSON ``{"train": [...], "validation": [...]}`` of Cosmos3-DROID episode indices.
@@ -37,6 +42,22 @@ from ..training.data import WindowDataset, load_manifest
 from . import masks
 
 SPLITS = ("train", "validation")
+GRIPPER_ACTION_COLUMN = 15  # rows.f32.npy: state (7 joints, gripper), then action (7 joints, gripper)
+CLOSE_THRESHOLD = 0.5  # commanded gripper: 0 open, 1 closed
+CLOSE_STEPS = (8, 27)  # a close at action step k of the window (inclusive range) keeps it
+
+
+def close_steps(gripper: np.ndarray) -> np.ndarray:
+    """Frames ``i`` of an episode where the commanded gripper closes: ``gripper[i - 1] < 0.5 <= gripper[i]``."""
+    gripper = np.asarray(gripper, np.float32)
+    return np.flatnonzero((gripper[:-1] < CLOSE_THRESHOLD) & (gripper[1:] >= CLOSE_THRESHOLD)) + 1
+
+
+def close_starts(gripper: np.ndarray, starts: list[int]) -> list[int]:
+    """The ``starts`` whose window closes the gripper at action step ``CLOSE_STEPS[0]..CLOSE_STEPS[1]``."""
+    closes = close_steps(gripper)
+    first, last = CLOSE_STEPS
+    return [s for s in starts if ((closes >= s + first) & (closes <= s + last)).any()]
 
 
 def blocks_path(masks_root: Path, episode_index: int, run: str) -> Path:
@@ -80,6 +101,7 @@ class DSFWindowDataset(WindowDataset):
         if chunk != masks.CHUNK:
             raise ValueError(f"DSF windows hold {masks.CHUNK} actions, the index {chunk}")
         kept, self.units, self.skipped = [], [], {}
+        rows = np.load(rows_path, mmap_mode="r")
         probe = WindowDataset.__new__(WindowDataset)  # only for valid_starts on the kept episodes
         probe.n_obs_steps, probe.chunk_size = None, chunk
         for episode in manifest["episodes"]:
@@ -100,8 +122,10 @@ class DSFWindowDataset(WindowDataset):
                 )
             probe.episodes = [episode]
             starts = [s for s in probe.valid_starts(0) if s % masks.BLOCK_FRAMES == 0]
+            first_row = int(episode["from_index"])
+            closing = set(close_starts(rows[first_row : first_row + int(episode["n_frames"]), GRIPPER_ACTION_COLUMN], starts))
             position = len(kept)
-            units = []
+            units, any_hidden = [], False
             for hidden, camera in enumerate(masks.HIDDEN_CAMERAS):
                 noisy = [
                     s
@@ -109,13 +133,15 @@ class DSFWindowDataset(WindowDataset):
                     if s // masks.BLOCK_FRAMES + masks.PREDICTED_BLOCKS <= len(block_high)
                     and cells[camera][s // masks.BLOCK_FRAMES : s // masks.BLOCK_FRAMES + masks.PREDICTED_BLOCKS].any()
                 ]
-                if noisy:
-                    units.append((position, hidden, noisy))
+                any_hidden = any_hidden or bool(noisy)
+                chosen = [s for s in noisy if s in closing]
+                if chosen:
+                    units.append((position, hidden, chosen))
             if units:
                 kept.append(episode)
                 self.units.extend(units)
             else:
-                self.skipped[index] = "no window with a hidden cell"
+                self.skipped[index] = "no gripper close in a hidden window" if any_hidden else "no window with a hidden cell"
         self.n_windows = sum(len(unit[2]) for unit in self.units)
         super().__init__(
             {**manifest, "episodes": kept}, source_root, rows_path, split=None, visits_per_epoch=visits_per_epoch,
@@ -202,6 +228,41 @@ def build_validation(config, **loader: Any) -> DSFWindowDataset:
     return _build(config, "validation", **loader)
 
 
+def count_close_windows(source_root, filter_path, episodes: set[int] | None = None) -> dict:
+    """Windows the close rule keeps on Cosmos3-DROID (data + meta files only): starts that are multiples of 4 among
+    the valid starts, with a gripper close at action step ``CLOSE_STEPS``. Masks are not consulted."""
+    import pyarrow.parquet as pq
+
+    from ..data.droid.index import build_manifest
+    from ..data.windows import valid_window_spans
+
+    root = Path(source_root)
+    manifest = build_manifest(root, filter_path, chunk_size=masks.CHUNK)
+    by_file: dict[str, list[dict]] = {}
+    for episode in manifest["episodes"]:
+        if episodes is None or int(episode["episode_index"]) in episodes:
+            by_file.setdefault(episode["data_file"], []).append(episode)
+    totals = {"episodes": 0, "episodes_with_close_window": 0, "closes": 0, "windows": 0, "close_windows": 0}
+    for data_file, group in sorted(by_file.items()):
+        table = pq.read_table(root / data_file, columns=["index", "action.gripper_position"])
+        index = table["index"].to_numpy()
+        gripper = table["action.gripper_position"].combine_chunks()
+        gripper = (gripper.flatten() if hasattr(gripper, "flatten") else gripper).to_numpy()  # [g] or g per row
+        position = {int(i): p for p, i in enumerate(index)}
+        for episode in group:
+            n, first = int(episode["n_frames"]), position[int(episode["from_index"])]
+            grip = gripper[first : first + n]
+            spans = valid_window_spans(n, episode["valid_ranges"], masks.CHUNK)
+            starts = [s for f, c in spans for s in range(f, f + c) if s % masks.BLOCK_FRAMES == 0]
+            kept = close_starts(grip, starts)
+            totals["episodes"] += 1
+            totals["episodes_with_close_window"] += bool(kept)
+            totals["closes"] += len(close_steps(grip))
+            totals["windows"] += len(starts)
+            totals["close_windows"] += len(kept)
+    return totals
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -211,7 +272,18 @@ def main() -> None:
     split.add_argument("--run", default="k0_ringrandom")
     split.add_argument("--validation", type=float, default=0.1)
     split.add_argument("--seed", type=int, default=2026)
+    count = commands.add_parser("count", help="windows the gripper-close rule keeps (no videos or masks needed)")
+    count.add_argument("source_root", type=Path, help="Cosmos3-DROID root with success/data and success/meta")
+    count.add_argument("filter", type=Path, help="keep_ranges_1_0_1.json")
+    count.add_argument("--episodes", type=Path, help="a JSON list of episode indices, or a split.json (train+validation)")
     arguments = parser.parse_args()
+    if arguments.command == "count":
+        chosen = None
+        if arguments.episodes:
+            listed = json.loads(arguments.episodes.read_text())
+            chosen = set(listed["train"] + listed["validation"]) if isinstance(listed, dict) else set(listed)
+        print(json.dumps(count_close_windows(arguments.source_root, arguments.filter, chosen), indent=1))
+        return
     output = arguments.output or arguments.masks_root / "split.json"
     result = write_split(arguments.masks_root, output, arguments.run, arguments.validation, arguments.seed)
     print(f"{len(result['train'])} train / {len(result['validation'])} validation episodes -> {output}")
