@@ -9,7 +9,7 @@
     "run": "k0_ringrandom",
     "split": "outputs/dsf/masks/split.json",
     "whole_window": true,
-    "ordinary_fraction": 0.3
+    "ordinary_fraction": 0.0
   },
   "policy": {
     "action_dim": 8,
